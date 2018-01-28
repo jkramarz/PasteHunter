@@ -68,10 +68,10 @@ async def paste_scanner(queue):
         paste_data = await queue.get()
         logging.debug("Found New {0} paste {1}".format(paste_data['pastesite'], paste_data['pasteid']))
         raw_paste_uri = paste_data['scrape_url']
-        if 'contents' in paste_data:
-            raw_paste_data = paste_data['contents']
+        if 'raw_paste' in paste_data:
+            raw_paste_data = paste_data['raw_paste']
         else:
-            raw_paste_data = paste_data['contents'] = requests.get(raw_paste_uri).text
+            raw_paste_data = requests.get(raw_paste_uri).text
 
         try:
             # Scan with yara

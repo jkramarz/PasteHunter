@@ -20,7 +20,7 @@ async def produce(queue):
                             'pasteid': message['data']['id'],
                             'pastesite': 'pastebin-stream',
                             'scrape_url': message['data']['url'],
-                            'contents': message['data']['contents'],
+                            'raw_paste': message['data']['contents'],
                         }
 
                         if 'username' in message['data']:
