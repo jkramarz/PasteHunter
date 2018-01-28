@@ -6,15 +6,12 @@ import yara
 import json
 import hashlib
 import requests
-import threading
 import importlib
 import logging
-from time import sleep
-from queue import Queue
 from common import parse_config
 from postprocess import post_email
-
-lock = threading.Lock()
+import sys
+import asyncio
 
 # Set some logging options
 logging.basicConfig(format='%(levelname)s:%(filename)s:%(message)s', level=logging.INFO)
@@ -27,11 +24,11 @@ conf = parse_config()
 
 logging.info("Configure Inputs")
 input_list = []
+
 for input_type, input_values in conf["inputs"].items():
     if input_values["enabled"]:
-        input_list.append(input_values["module"])
+        input_list.append(input_values)
         logging.info("Enabled Input: {0}".format(input_type))
-
 
 logging.info("Configure Outputs")
 outputs = []
@@ -62,19 +59,19 @@ def yara_index(rule_path, blacklist, test_rules):
                 include = 'include "{0}"\n'.format(filename)
                 yar.write(include)
 
-
-def paste_scanner():
+async def paste_scanner(queue):
     # Get a paste URI from the Queue
     # Fetch the raw paste
     # scan the Paste
     # Store the Paste
     while True:
-        paste_data = q.get()
+        paste_data = await queue.get()
         logging.debug("Found New {0} paste {1}".format(paste_data['pastesite'], paste_data['pasteid']))
-        # get raw paste and hash them
         raw_paste_uri = paste_data['scrape_url']
-        raw_paste_data = requests.get(raw_paste_uri).text
-        # Process the paste data here
+        if 'contents' in paste_data:
+            raw_paste_data = paste_data['contents']
+        else:
+            raw_paste_data = paste_data['contents'] = requests.get(raw_paste_uri).text
 
         try:
             # Scan with yara
@@ -133,8 +130,7 @@ def paste_scanner():
         #ToDo: Need to make this check for each output not universal
 
         paste_site = paste_data['pastesite']
-        store_all = conf['inputs']['pastebin']['store_all']
-        if store_all is True and paste_site == 'pastebin.com':
+        if paste_site == 'pastebin.com' and conf['inputs']['pastebin']['store_all']:
             if len(results) == 0:
                 results.append('no_match')
 
@@ -154,7 +150,55 @@ def paste_scanner():
                     logging.error("Unable to store {0}".format(paste_data["pasteid"]))
 
         # Mark Tasks as complete
-        q.task_done()
+        queue.task_done()
+
+def load_streaming_modules(queue):
+    streaming_inputs = []
+    for i in input_list:
+        if 'streaming' in i and i['streaming']:
+            _module = importlib.import_module(i["module"])
+            streaming_inputs.append(
+                _module.produce(queue)
+            )
+    return streaming_inputs
+
+def list_pooling_modules():
+    for i in input_list:
+        if not 'streaming' in i or not i['streaming']:
+            yield i['module']
+
+async def paste_pooler(queue):
+    logging.info("Populating Queue")
+    if os.path.exists('paste_history.tmp'):
+        with open('paste_history.tmp') as json_file:
+            paste_history = json.load(json_file)
+    else:
+        paste_history = {}
+
+    # Now Fill the Queue
+    while True:
+        for input_name in list_pooling_modules():
+            if input_name in paste_history:
+                input_history = paste_history[input_name]
+            else:
+                input_history = []
+            i = importlib.import_module(input_name)
+            # Get list of recent pastes
+            logging.info("Fetching paste list from {0}".format(input_name))
+            paste_list, history = i.recent_pastes(conf, input_history)
+            print (paste_list)
+            for paste in paste_list:
+                await queue.put(paste)
+            paste_history[input_name] = history
+
+        logging.debug("Writing History")
+        # Write History
+        with open('paste_history.tmp', 'w') as outfile:
+            json.dump(paste_history, outfile)
+
+        # Slow it down a little
+        logging.info("Sleeping for " + str(conf['general']['run_frequency']) + " Seconds")
+        await asyncio.sleep(conf['general']['run_frequency'])
 
 
 if __name__ == "__main__":
@@ -173,50 +217,20 @@ if __name__ == "__main__":
         sys.exit()
 
     # Create Queue to hold paste URI's
-    q = Queue()
+    queue = asyncio.Queue()
+    loop = asyncio.get_event_loop()
 
-    # Threads
-    for i in range(5):
-        t = threading.Thread(target=paste_scanner)
-        t.daemon = True
-        t.start()
+    inputs = asyncio.gather(*load_streaming_modules(queue))
+    scanner = asyncio.gather(paste_scanner(queue))
+    pooler = asyncio.gather(paste_pooler(queue))
 
-    # Now Fill the Queue
     try:
-        while True:
-            # Paste History
-            logging.info("Populating Queue")
-            if os.path.exists('paste_history.tmp'):
-                with open('paste_history.tmp') as json_file:
-                    paste_history = json.load(json_file)
-            else:
-                paste_history = {}
-
-            for input_name in input_list:
-                if input_name in paste_history:
-                    input_history = paste_history[input_name]
-                else:
-                    input_history = []
-
-                i = importlib.import_module(input_name)
-                # Get list of recent pastes
-                logging.info("Fetching paste list from {0}".format(input_name))
-                paste_list, history = i.recent_pastes(conf, input_history)
-                for paste in paste_list:
-                    q.put(paste)
-                paste_history[input_name] = history
-
-            logging.debug("Writing History")
-            # Write History
-            with open('paste_history.tmp', 'w') as outfile:
-                json.dump(paste_history, outfile)
-
-            # Flush the list
-            q.join()
-
-            # Slow it down a little
-            logging.info("Sleeping for " + str(conf['general']['run_frequency']) + " Seconds")
-            sleep(conf['general']['run_frequency'])
-
+        loop.run_until_complete(
+            asyncio.gather(
+                inputs,
+                scanner,
+                pooler
+            )
+        )
     except KeyboardInterrupt:
         logging.info("Stopping Threads")
